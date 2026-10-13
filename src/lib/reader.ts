@@ -1,0 +1,158 @@
+import { z } from "zod";
+import { db, must, logEvent, type EvidenceRow } from "./db";
+import { llmObject, MODELS } from "./llm";
+import { fetchImage, MAX_IMAGES } from "./ingest";
+
+// ---------- Schemas ----------
+
+const ev = z.array(z.string()).describe("Evidence IDs from the evidence list, e.g. ['ig:post:3','li:exp:0']");
+const conf = z.number().min(0).max(1);
+
+export const PersonProfileSchema = z.object({
+  headline: z.string().describe("One specific human line, e.g. 'Product engineer who disappears into the Sahyadris every monsoon'"),
+  vibe: z.string().describe("2-3 warm, specific sentences. No clichés."),
+  hobbies: z.array(z.object({ name: z.string(), evidence: ev, confidence: conf })),
+  interests: z.array(z.object({ name: z.string(), evidence: ev, confidence: conf })),
+  values: z.array(z.object({ name: z.string(), why: z.string(), evidence: ev, confidence: conf })),
+  lifestyle: z.object({ rhythm: z.string(), social_energy: z.string(), travel: z.string(), fitness: z.string(), evidence: ev }),
+  career: z.object({ current: z.string(), trajectory: z.string(), ambition_level: z.string(), evidence: ev }),
+  communication_style: z.object({ description: z.string(), evidence: ev }),
+  needs: z.array(z.object({ need: z.string(), why: z.string().describe("Reasoning: this is an inference"), evidence: ev, confidence: conf })),
+  likely_dealbreakers: z.array(z.object({ item: z.string(), why: z.string().describe("Reasoning: this is an inference"), evidence: ev, confidence: conf })),
+  green_flags_for_them: z.array(z.string()),
+  conversation_hooks: z.array(z.string()),
+  unknowns: z.array(z.string()).describe("What the two sources could NOT tell us. Be honest."),
+  public_card: z.object({ headline: z.string(), top_interests: z.array(z.string()).describe("exactly 3"), one_liner: z.string() }),
+});
+export type PersonProfile = z.infer<typeof PersonProfileSchema>;
+
+const VisionSchema = z.object({
+  images: z.array(
+    z.object({
+      image_number: z.number().int(),
+      activities: z.array(z.string()),
+      setting: z.enum(["outdoors", "city", "home", "event", "travel", "work", "other"]),
+      hobby_signals: z.array(z.string()).describe("objects or scenes that signal hobbies, e.g. 'film camera', 'climbing rope'"),
+      social_context: z.enum(["solo", "pair", "group", "no people"]),
+      caption: z.string().describe("short neutral description of the scene"),
+    }),
+  ),
+});
+
+// ---------- Safety: forbidden attributes ----------
+
+export const FORBIDDEN = [
+  /\b(gay|lesbian|bisexual|queer|straight|heterosexual|homosexual|sexual orientation|orientation)\b/i,
+  /\b(religio\w*|hindu|muslim|islam\w*|christian\w*|sikh|jain|buddhis\w*|jewish|church|temple|mosque|god-fearing|faith)\b/i,
+  /\b(caste|brahmin|dalit|ethnic\w*|racial|skin colou?r)\b/i,
+  /\b(health condition|illness|disease|disorder|disabilit\w*|diagnos\w*|mental health|depress\w*|anxiety|pregnan\w*)\b/i,
+  /\b(politic\w*|left-wing|right-wing|bjp|congress party)\b/i,
+  /\b(income|salary|wealthy|rich|net worth|affluent)\b/i,
+  /\b(attractive|beautiful|handsome|pretty|hot|sexy|good-looking|body type|slim|thin|fat|overweight|physique)\b/i,
+];
+export const isForbidden = (s: string) => FORBIDDEN.some((r) => r.test(s));
+
+const READER_SYSTEM = `You are "the Reader": you build a dating profile of ONE person from exactly two sources, their LinkedIn and their public Instagram, provided as an evidence list. Nothing else exists. Do not use any outside knowledge about this person.
+
+Rules:
+- Every claim cites evidence IDs that appear in the evidence list. A claim without valid citations will be deleted.
+- Specific beats generic: "Runs half marathons, posted 3 race bibs in 2025" not "likes fitness". Name places, counts, years when the evidence shows them.
+- Low evidence → low confidence, and say so in "unknowns". Never invent biography. If Instagram has few posts, say so.
+- "needs" and "likely_dealbreakers" are inferences: phrase the "why" as reasoning ("Their posts suggest…, so they'd likely need…").
+- NEVER infer or mention sexual orientation, gender preferences, religion, caste, ethnicity, health, political views, income/wealth, or anything about looks, attractiveness or body. Photos are only evidence of activities, settings, hobbies and aesthetic.
+- public_card is the ONLY thing other people's agents will see before a date: friendly, specific, no private inferences.
+- Write in English, in the third person, warmly but without flattery.`;
+
+function evidenceText(rows: Pick<EvidenceRow, "id" | "text">[]) {
+  return rows.map((e) => `[${e.id}] ${e.text}`).join("\n");
+}
+
+/** Drop citations that don't exist, claims that end up uncited, and anything touching forbidden attributes. */
+export function validateProfile(p: PersonProfile, validIds: Set<string>): PersonProfile {
+  const keep = (ids: string[]) => ids.filter((id) => validIds.has(id));
+  const clean = <T extends { evidence: string[] }>(items: T[], text: (t: T) => string) =>
+    items.map((i) => ({ ...i, evidence: keep(i.evidence) })).filter((i) => i.evidence.length > 0 && !isForbidden(text(i)));
+  const safe = (xs: string[]) => xs.filter((x) => !isForbidden(x));
+  return {
+    ...p,
+    hobbies: clean(p.hobbies, (h) => h.name),
+    interests: clean(p.interests, (h) => h.name),
+    values: clean(p.values, (v) => `${v.name} ${v.why}`),
+    needs: clean(p.needs, (n) => `${n.need} ${n.why}`),
+    likely_dealbreakers: clean(p.likely_dealbreakers, (d) => `${d.item} ${d.why}`),
+    lifestyle: { ...p.lifestyle, evidence: keep(p.lifestyle.evidence) },
+    career: { ...p.career, evidence: keep(p.career.evidence) },
+    communication_style: { ...p.communication_style, evidence: keep(p.communication_style.evidence) },
+    green_flags_for_them: safe(p.green_flags_for_them),
+    conversation_hooks: safe(p.conversation_hooks),
+    unknowns: p.unknowns,
+    public_card: { ...p.public_card, top_interests: safe(p.public_card.top_interests).slice(0, 3) },
+  };
+}
+
+async function perceive(personId: string, posts: EvidenceRow[]) {
+  const withImg = posts.filter((p) => p.image_url).slice(0, MAX_IMAGES);
+  if (!withImg.length) return [];
+  const loaded = (await Promise.all(withImg.map(async (p) => ({ p, img: await fetchImage(p.image_url!) })))).filter((x) => x.img);
+  if (!loaded.length) return [];
+  await logEvent(personId, "reader", `Looking at ${loaded.length} Instagram photos…`);
+  const content: ({ type: "text"; text: string } | { type: "image"; image: Uint8Array; mediaType: string })[] = [
+    { type: "text", text: `Describe each of these ${loaded.length} photos. Only activities, setting, hobby signals, social context and a neutral caption. Never comment on anyone's appearance, body, ethnicity, religion or attractiveness.` },
+  ];
+  loaded.forEach((x, i) => {
+    content.push({ type: "text", text: `Image ${i + 1}:` });
+    content.push({ type: "image", image: x.img!.bytes, mediaType: x.img!.type });
+  });
+  const res = await llmObject({
+    tier: "smart",
+    schema: VisionSchema,
+    system: "You describe photos neutrally for a hobby/activity profile. No judgments about people's looks or identity.",
+    messages: [{ role: "user", content }],
+    label: "vision",
+  });
+  return res.images
+    .filter((im) => im.image_number >= 1 && im.image_number <= loaded.length)
+    .map((im) => {
+      const post = loaded[im.image_number - 1].p;
+      const n = post.id.split(":")[2];
+      const text = `Photo: ${im.caption}. Activities: ${im.activities.join(", ") || "none"}. Setting: ${im.setting}. Hobby signals: ${im.hobby_signals.join(", ") || "none"}. ${im.social_context}.`;
+      return { person_id: personId, id: `ig:img:${n}`, source: "instagram" as const, kind: "image", text: isForbidden(text) ? `Photo: ${im.setting}, ${im.social_context}.` : text, image_url: post.image_url, meta: { post: post.id } };
+    });
+}
+
+export async function readPerson(personId: string): Promise<PersonProfile> {
+  const evidence = must(await db().from("evidence").select("*").eq("person_id", personId), "load evidence") as EvidenceRow[];
+  const person = must(await db().from("people").select("name").eq("id", personId).single(), "load person");
+
+  // Pass A: perception (one batched vision call)
+  const imgs = await perceive(personId, evidence.filter((e) => e.kind === "post"));
+  if (imgs.length) {
+    must(await db().from("evidence").upsert(imgs), "save image evidence");
+    const acts = imgs.flatMap((i) => i.text.match(/Activities: ([^.]*)/)?.[1].split(", ") ?? []).filter((a) => a && a !== "none");
+    const top = Object.entries(acts.reduce<Record<string, number>>((m, a) => ((m[a.toLowerCase()] = (m[a.toLowerCase()] ?? 0) + 1), m), {})).sort((a, b) => b[1] - a[1])[0];
+    await logEvent(personId, "reader", top ? `Seeing ${top[0]} in ${top[1]} photo${top[1] > 1 ? "s" : ""}…` : `Described ${imgs.length} photos`);
+  }
+  const all = [...evidence, ...imgs];
+
+  // Pass B: synthesis
+  await logEvent(personId, "reader", `Synthesizing profile from ${all.length} pieces of evidence…`);
+  const raw = await llmObject({
+    tier: "smart",
+    schema: PersonProfileSchema,
+    system: READER_SYSTEM,
+    prompt: `Person's name: ${person.name}\n\nEVIDENCE (the only things you know):\n${evidenceText(all)}\n\nBuild their profile.`,
+    maxOutputTokens: 6000,
+    label: "reader",
+  });
+  const profile = validateProfile(raw, new Set(all.map((e) => e.id)));
+  const dropped =
+    raw.hobbies.length + raw.interests.length + raw.values.length + raw.needs.length + raw.likely_dealbreakers.length -
+    (profile.hobbies.length + profile.interests.length + profile.values.length + profile.needs.length + profile.likely_dealbreakers.length);
+  must(await db().from("profiles").upsert({ person_id: personId, profile, model: MODELS.smart, created_at: new Date().toISOString() }), "save profile");
+  await logEvent(
+    personId,
+    "reader",
+    `Profile ready: ${profile.hobbies.length} hobbies, ${profile.interests.length} interests, ${profile.values.length} values, ${profile.unknowns.length} honest unknowns${dropped ? ` (validator dropped ${dropped} uncited claims)` : ""}`,
+  );
+  return profile;
+}
