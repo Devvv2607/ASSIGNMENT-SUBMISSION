@@ -111,3 +111,35 @@ end $$;
 insert into storage.buckets (id, name, public)
 values ('media', 'media', true)
 on conflict (id) do nothing;
+
+-- ---------- v2: resumable step pipelines, rate limits, cost tracking ----------
+
+alter table people add column if not exists stage text not null default 'scrape_linkedin';
+alter table people add column if not exists lock_until timestamptz;
+alter table people add column if not exists planned_dates uuid[] not null default '{}';
+alter table dates add column if not exists lock_until timestamptz;
+alter table raw_sources add column if not exists usage_usd numeric;
+
+create table if not exists llm_usage (
+  id bigserial primary key,
+  person_id uuid references people(id) on delete set null,
+  date_id uuid references dates(id) on delete set null,
+  step text not null,
+  model text not null,
+  prompt_tokens int not null,
+  completion_tokens int not null,
+  created_at timestamptz not null default now()
+);
+alter table llm_usage enable row level security;
+
+create table if not exists rate_events (
+  id bigserial primary key,
+  kind text not null,            -- add | date
+  ip text not null,
+  created_at timestamptz not null default now()
+);
+create index if not exists rate_events_kind_time on rate_events(kind, created_at);
+alter table rate_events enable row level security;
+
+-- Make PostgREST pick up the new tables immediately.
+notify pgrst, 'reload schema';

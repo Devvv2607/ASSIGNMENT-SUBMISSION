@@ -8,7 +8,7 @@ import type { Debrief } from "@/lib/date";
 
 const LIVE = ["queued", "prep", "venue", "talking", "debrief"];
 const STATUS_TEXT: Record<string, string> = {
-  queued: "Getting ready…",
+  queued: "Both Proxies are privately preparing…",
   prep: "Both Proxies are privately preparing…",
   venue: "Picking a place…",
   talking: "On the date",
@@ -32,6 +32,35 @@ export function DateView({ initial }: { initial: DatePayload }) {
     }, 1500);
     return () => clearInterval(t);
   }, [live, d.date.id]);
+
+  // Drive the date one stage/turn per request while it's unfinished. The server lock makes
+  // concurrent viewers safe, and a refresh resumes from the stored stage.
+  const [driveError, setDriveError] = useState<string | null>(null);
+  const [driveKey, setDriveKey] = useState(0);
+  useEffect(() => {
+    if (!live) return;
+    let stop = false;
+    (async () => {
+      let failures = 0;
+      setDriveError(null);
+      while (!stop) {
+        const r = await fetch(`/api/dates/${d.date.id}/step`, { method: "POST" }).catch(() => null);
+        const j = r ? await r.json().catch(() => ({})) : { error: "Network error" };
+        if (!r || !r.ok) {
+          if (++failures >= 3) return setDriveError(j.error ?? "Step failed");
+          await new Promise((res) => setTimeout(res, 3000 * failures));
+          continue;
+        }
+        failures = 0;
+        if (["done", "error", "missing"].includes(j.status)) return;
+        if (!j.worked) await new Promise((res) => setTimeout(res, 2500));
+      }
+    })();
+    return () => {
+      stop = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [d.date.id, driveKey]);
 
   useEffect(() => {
     if (live && d.turns.length > prevTurns.current) bottom.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -64,6 +93,12 @@ export function DateView({ initial }: { initial: DatePayload }) {
           </p>
         )}
         {d.date.status === "error" && <p className="mt-4 text-bad">This date failed: {d.date.error}</p>}
+        {live && driveError && (
+          <div className="mt-4 text-sm text-bad">
+            <p className="break-words">Paused after 3 failed attempts: {driveError}</p>
+            <button onClick={() => setDriveKey((k) => k + 1)} className="btn-ghost mt-2">Resume</button>
+          </div>
+        )}
       </div>
 
       {/* Toggle */}

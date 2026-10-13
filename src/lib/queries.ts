@@ -5,15 +5,21 @@ import type { Debrief } from "./date";
 export type GridPerson = Pick<Person, "id" | "name" | "avatar_url" | "status"> & { card: PersonProfile["public_card"] | null };
 
 export async function getGrid() {
-  const [people, profiles, dateCount, turnCount] = await Promise.all([
+  const [people, profiles, dateCount, turnCount, best] = await Promise.all([
     db().from("people").select("id, name, avatar_url, status").in("status", ["ready", "queued", "ingesting", "reading"]).order("created_at"),
     db().from("profiles").select("person_id, profile"),
     db().from("dates").select("id", { count: "exact", head: true }).eq("status", "done"),
     db().from("date_turns").select("date_id", { count: "exact", head: true }),
+    // Featured date: the highest mutual score among finished dates (ties → most recent).
+    db().from("dates").select("id, a_id, b_id, venue, mutual_score").eq("status", "done").order("mutual_score", { ascending: false }).order("ended_at", { ascending: false }).limit(1).maybeSingle(),
   ]);
   const cards = new Map((must(profiles, "profiles") as { person_id: string; profile: PersonProfile }[]).map((p) => [p.person_id, p.profile.public_card]));
   const grid: GridPerson[] = (must(people, "people") as GridPerson[]).map((p) => ({ ...p, card: cards.get(p.id) ?? null }));
-  return { grid, dates: dateCount.count ?? 0, turns: turnCount.count ?? 0 };
+  const names = new Map(grid.map((p) => [p.id, p.name]));
+  const featured = best.data
+    ? { id: best.data.id as string, venue: best.data.venue as string | null, mutual: Number(best.data.mutual_score), names: [names.get(best.data.a_id) ?? "", names.get(best.data.b_id) ?? ""] }
+    : null;
+  return { grid, dates: dateCount.count ?? 0, turns: turnCount.count ?? 0, featured };
 }
 
 export type DatePayload = {

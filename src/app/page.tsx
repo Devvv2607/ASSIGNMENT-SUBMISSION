@@ -28,6 +28,11 @@ export default async function Home() {
         <div className="mt-8 flex flex-wrap items-center gap-4">
           <Link href="/add" className="btn">Add a person</Link>
           <Link href="/how-it-works" className="btn-ghost">How it works</Link>
+          {data?.featured && (
+            <Link href={`/date/${data.featured.id}`} className="btn-ghost !border-accent/60">
+              ♥ Featured date: {data.featured.names.map((n) => n.split(" ")[0]).join(" & ")} · {data.featured.mutual}
+            </Link>
+          )}
         </div>
         {data && (
           <p className="mt-8 font-serif text-xl text-muted">

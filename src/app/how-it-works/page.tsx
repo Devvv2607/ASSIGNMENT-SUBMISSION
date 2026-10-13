@@ -8,7 +8,8 @@ const PIPELINE = `flowchart LR
   A2 -->|private: true| X[Rejected]
   A1 --> E[(Evidence store<br/>li:exp:2, ig:post:7 …)]
   A2 --> E
-  E --> V[Reader pass A<br/>vision on 6 photos]
+  A2 --> C[(Photos cached<br/>to Supabase Storage)]
+  C --> V[Reader pass A<br/>vision, 2 calls × 3 photos]
   V --> E
   E --> R[Reader pass B<br/>synthesis, cited claims]
   R --> VAL{Validator<br/>drop uncited +<br/>forbidden claims}
@@ -58,8 +59,8 @@ export default function HowItWorks() {
 
       <Block title="The Reader">
         <ul>
-          <li><b>Pass A, perception:</b> one batched vision call on up to 6 Instagram photos returns activities, setting, hobby signals and social context, stored as new evidence. It never comments on looks.</li>
-          <li><b>Pass B, synthesis:</b> Claude Sonnet reads the whole evidence store and returns a Zod-validated profile: hobbies, interests, values, lifestyle, career, communication style, needs, likely dealbreakers, conversation hooks, and honest unknowns. Each claim carries a confidence and its evidence IDs.</li>
+          <li><b>Pass A, perception:</b> the 6 most recent Instagram photos (copied to our own storage first, since Instagram links expire) go to a vision model in two calls of 3. It returns activities, setting, hobby signals and social context, stored as new evidence. It never comments on looks.</li>
+          <li><b>Pass B, synthesis:</b> a large model reads the whole evidence store and returns a Zod-validated profile: hobbies, interests, values, lifestyle, career, communication style, needs, likely dealbreakers, conversation hooks, and honest unknowns. Each claim carries a confidence and its evidence IDs.</li>
           <li>Needs and dealbreakers are labelled as inferences, with reasoning.</li>
         </ul>
       </Block>
@@ -72,7 +73,8 @@ export default function HowItWorks() {
           <li>Each Proxy&apos;s system prompt has its person&apos;s full profile plus a <b>private agenda</b>: needs to check and dealbreakers to test. It speaks in its person&apos;s voice but may not claim anything outside the profile.</li>
           <li>It is told: <i>&ldquo;You are not here to be liked. You are here to find out if this is a good fit.&rdquo;</i> Disagreement is allowed and either side can end the date after turn 8.</li>
           <li>Every turn returns <code>say</code>, a private <code>inner_thought</code> (toggle it on the date page), and signals (need checked, green flag, red flag).</li>
-          <li>Turns use Claude Haiku for speed; prep, venue, and debriefs use Claude Sonnet.</li>
+          <li>Models run on Groq: <code>gpt-oss-20b</code> for turns (speed), <code>gpt-oss-120b</code> for analysis, prep, venue and debriefs, <code>qwen3.8-27b</code> for photos. Every output is JSON validated by a Zod schema; invalid output is retried once with the validation error.</li>
+          <li>Each step of the pipeline and each turn of a date is its own short request with its state in the database, so a refresh resumes rather than restarts, and two viewers can&apos;t double-run a date.</li>
         </ul>
       </Block>
 
@@ -89,6 +91,7 @@ export default function HowItWorks() {
         <ul>
           <li>The seed pool is people who opted in; each record stores its <code>consent_source</code>. The add form requires confirming the person agreed.</li>
           <li>Private Instagram accounts are rejected with a clear message, and nothing scraped from them is kept.</li>
+          <li>The public add flow is rate-limited (5 people per IP per hour, plus a global daily cap) and deduplicated by LinkedIn URL, so the same person is never scraped twice.</li>
           <li><b>Remove this person</b> deletes their profile, evidence, cached images, and every date involving them.</li>
           <li>The analysis never infers sexual orientation, religion, caste, ethnicity, health, politics, income, or anything about looks. The prompt forbids it and a validator strips any claim that slips through.</li>
           <li><b>Orientation is never inferred.</b> Rankings default to &ldquo;everyone&rdquo;; a viewer-side filter (men/women) uses only gender that was self-reported at submission.</li>
